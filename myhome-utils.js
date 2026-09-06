@@ -1,557 +1,289 @@
-var exports = module.exports = {};
+module.exports = function (RED) {
+  let net = require ('net');
+  let mhutils = require ('./myhome-utils');
 
-const ACK  = '*#*1##';
-const NACK = '*#*0##';
-const START_COMMAND = '*99*0##';
-const START_MONITOR = '*99*1##';
-const SERVER_REQUIRES_HMAC1 = '*98*1##';
-const SERVER_REQUIRES_HMAC2 = '*98*2##';
-const INTER_COMMANDS_DELAY = 50; // ms
-// Refresh all states on (re)connect management : for lights and shutters only, by calling a state on GENERAL (WHERE=0)
-// Can be enabled per type in Gateway config. An object is built beforehand to manage parameters of both types
-const REFRESH_ALLLIGHTS = '*#1*0##';
-const REFRESH_ALLSHUTTERS = '*#2*0##';
-const ONCONNECT_REFRESH_COMMANDS = [
-  { confignode_refreshflag: 'lights_onconnect_refreshloads', command: REFRESH_ALLLIGHTS, label: 'lights' },
-  { confignode_refreshflag: 'shutters_onconnect_refreshstate', command: REFRESH_ALLSHUTTERS, label: 'shutters' }
-];
+  const ACK  = '*#*1##';
+  const NACK = '*#*0##';
+  const START_MONITOR = '*99*1##';
+  const RESTART_CONNECT_TIMEOUT = 500; // ms
+  const RESTART_CONNECT_TIMEOUT_MAX = 30000; // ms
+  const SPEAK_FIRST_TIMEOUT = 800; // ms - some gateways (e.g. MH201) never send an unsolicited greeting ACK
 
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// MHUtils INTERNAL Function : Internal node event logger
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-function logNodeEvent (callingNode, logType, riseLevel, logMsg) {
-  // logType can be : debug / log / warn / error
+  // WHO=4 passive discovery, one regex per frame shape myhome-thermo-zone.js itself reads
+  const ZONE_DISCOVERY_REGEXES = [
+    /^\*#4\*([1-9]\d?)\*(?:0|14)\*\d{4}(?:\*3)?##/, // master probe temperature / set-point temperature
+    /^\*4\*\d+\*([1-9]\d?)##/,                       // zone operation mode (master-probe WHERE)
+    /^\*#4\*([1-9]\d?)#\d\*20\*\d##/,                // actuator status for zone
+    /^\*#4\*([1-9]\d?)\*13\*\d{2}##/,                // local offset status
+    /^\*4\*\d{3}\*#([1-9]\d?)##/                     // zone operation mode via Central Unit
+  ];
 
-  // Compute current level based on type provided. Defaults to debug.
-  let logLevels = [];
-  logLevels[0] = 'debug';
-  logLevels[1] = 'log';
-  logLevels[2] = 'warn';
-  logLevels[3] = 'error';
-  let curLogLevel = Math.max (0 , logLevels.indexOf (logType));
+  function MyHomeGatewayNode (config) {
+    RED.nodes.createNode (this, config);
 
-  // When the function is called is 'Rise level' mode, apply it now to index
-  if (riseLevel) {
-    curLogLevel++;
-  }
+    var node = this;
+    let persistentObj = {logEnabled:true}; // Log is always enabled when gateway connects
+    let failedConnectionAttempts = 0;
+    let isTryingToConnect = false;
+    let speakFirstTimer;
 
-  // ensure index remains in boundaries
-  curLogLevel = Math.min (curLogLevel , logLevels.length);
+    node.client = undefined;
+    node.host = config.host;
+    node.port = config.port;
+    node.pass = config.pass || '';
+    node.lights_onconnect_refreshloads = config.lights_onconnect_refreshloads;
+    node.shutters_onconnect_refreshstate = config.shutters_onconnect_refreshstate;
+    node.points = Array.isArray (config.points) ? config.points : []; // BUS points registry (room/description/icon/... per category) - read by device nodes for msg.mh_nodeConfigInfo
+    node.log_out_cmd = config.log_out_cmd || false;
+    node.discoveredPoints = { light: {}, shutter: {}, energy: {}, thermozone: {} }; // all points for which something was seen on the BUS. Used by the gateway config editor for auto-discovered points
+    node.log_config = {
+      "log_out_cmd": config.log_out_cmd || false,
+      "log_in_lights": config.log_in_lights || false,
+      "log_in_shutters": config.log_in_shutters || false,
+      "log_in_temperature": config.log_in_temperature || false,
+      "log_in_scenario": config.log_in_scenario || false,
+      "log_in_energy": config.log_in_energy || false,
+      "log_in_others": config.log_in_others || false
+    };
+    node.timeout = (Number(config.timeout) || 0)*1000; // ms
+    node.setMaxListeners (100);
 
-  // Apply log now
-  callingNode[logLevels[curLogLevel]] (logMsg);
-}
-exports.logNodeEvent = logNodeEvent;
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    node.client = new net.Socket();
 
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// EXTERNAL Function : Gateway connection & log-in
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-function processInitialConnection (startCommand, packet, netSocket, callingNode, gateway, persistentObj, error) {
-  // Build (or get) default values from persistent object (which is kept by calling node and provided back at each received packet to be able to fill-in info)
-  persistentObj.state = persistentObj.state || 'disconnected';
-  persistentObj.HMAC_Auth = persistentObj.HMAC_Auth || [];
-  let logEnabled = persistentObj.logEnabled || false;
-
-  if (persistentObj.state === 'connected') {
-    // Already connected, no need to do anything
-    return true;
-  }
-
-  // When we have a non acknowledged return, always abort
-  if (packet === NACK) {
-    logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : NACK command received, aborting.');
-    let errorMsg = "Gateway connection/authentication failed (NACK). Last reached state was '" + persistentObj.state + "'";
-    persistentObj.state = 'disconnected';
-    error (startCommand, errorMsg); // error callback to stop function
-    return false;
-  }
-
-  // Reached once authentication (if any) succeeded : mark as connected and optionally kick off a
-  // lights/shutters/... refresh (see ONCONNECT_REFRESH_COMMANDS above)
-  function completeConnection () {
-    logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : Connection successful !');
-    persistentObj.state = 'connected';
-    // When starting the monitoring (i.e. the calling node is the gateway), refresh all connected
-    // lights/shutters/... if configured so, per category.
-    // TechNote : the command is delayed by a few seconds. During tests, without such delay, the gateway did not respond (or only partially) is if it was too busy
-    if (startCommand === START_MONITOR) {
-      ONCONNECT_REFRESH_COMMANDS.forEach (function (refresh) {
-        if (!callingNode[refresh.confignode_refreshflag]) { return; }
-        logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : gathering status of all connected ' + refresh.label + ' within a few seconds...');
-        setTimeout (function() {
-          logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : gathering status of all connected ' + refresh.label + ' started...');
-          let success_callback = function (commands, cmd_responses, cmd_failed) {
-            logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : gathering status of all connected ' + refresh.label + ' was successful (' + cmd_responses.length + ' responded ; ' + cmd_failed.length + ' did not respond)');
-          };
-          let error_callback = function (cmd_failed, nodeStatusErrorMsg) {
-            logNodeEvent (callingNode, 'warn', logEnabled, 'gateway connection : gathering status of all connected ' + refresh.label + ' started FAILED : ' + nodeStatusErrorMsg);
-          };
-          executeCommand (callingNode, refresh.command, gateway, 0, false, success_callback, error_callback);
-        } , 3000);
+      node.client.on ('data', function (data) {
+        if (speakFirstTimer) { clearTimeout (speakFirstTimer); speakFirstTimer = null; }
+        let allframes = data.toString();
+        let bufferedFrames = allframes;
+        while (bufferedFrames.length > 0) {
+          let frameMatch = bufferedFrames.match (/(\*.+?##)(.*)/) || [];
+          let frame = frameMatch[1] || '';
+          bufferedFrames = frameMatch[2] || '';
+          if (frame) {
+            node.debug ("Parsing socket data (current: '" + frame + "' / buffered:'" + bufferedFrames + "' / full raw data : '" + allframes + "')");
+            // As long as initial connection is not OK, all frames are transmitted to a central function managing this
+            if (mhutils.processInitialConnection (START_MONITOR, frame, node.client, node, node, persistentObj, internalError)) {
+              // We are connected OK, pass the frame to the commands & responses management part
+              failedConnectionAttempts = 0;
+              parseFrame (frame);
+            }
+          }
+        }
       });
-    }
-    return true;
-  }
 
-  // The connection procedure differs based on how authentication is defined
-  // - Open password check is not asked because we are connecting from an authorized IP range (=returns ACK directly)
-  // - Open password check must be made in basic mode (password is numeric, client receives a hash and 'merges' it with password to return a kind of a hash
-  // - Open password check must be made in HMAC mode (password is alphanumeric, server first responds with the HMAC mode being used, when acknowledged by client,
-  //    returns a server random hash (Ra) which the client must use to generate its own random part (Rb), and a full hash result using the password (Ra,Rb,A,B,Kab),
-  //    the server finally returns another hash the client was able to compute itself too when sending (Ra,Rb,Kab)
-  switch (persistentObj.state) {
-    case 'disconnected': {
-      if (packet == ACK) {
-        logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : handshake acknowledged, asking for authentication if required...');
-        persistentObj.state = 'handshake';
-        netSocket.write (startCommand);
-      }
-      return false;
+      node.client.on ('error', function () {
+        internalError ('', 'socket error connecting to ' + node.host + ':' + node.port);
+      });
+
+      node.client.on ('close', function() {
+        internalError ('', 'socket connection closed');
+      });
+
+    function internalError (cmd_failed, errorMsg) {
+      // In case of error / disconnection / close, try automated restart
+      node.warn ("gateway connection issue (" + errorMsg + "): last known state was '" + persistentObj.state + "', trying to re-connect...");
+      if (speakFirstTimer) { clearTimeout (speakFirstTimer); speakFirstTimer = null; }
+      node.disconnect (RESTART_CONNECT_TIMEOUT);
     }
 
-    case 'handshake': {
-      // responded to an authentication request
-      if (packet === ACK) {
-        // No password to provide : working in local reserved network addresses
-        logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : request to authenticate acknowledged, no password check required (working in local IP address allowed range)...');
-        return completeConnection ();
-      } else if (packet === SERVER_REQUIRES_HMAC1 || packet === SERVER_REQUIRES_HMAC2) {
-        // The gateway sent back a HMAC authentication request in HMAC format, we acknowledge it to receive a Hash key
-        let hmacType = (packet === SERVER_REQUIRES_HMAC1) ? 'SHA-1' : 'SHA-2 [256]';
-        logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : request to authenticate acknowledged, authenticating using HMAC (' + hmacType + ') password check required...');
-        persistentObj.state = 'authenticating_HMAC';
-        netSocket.write (ACK);
-      } else {
-        // The gateway requires a basic password authentication, retrieve the key to generate a hashed password
-        let hashKey = packet.match (/^\*#(\d+)##/);
-        if (hashKey === null) {
-          logNodeEvent (callingNode, 'warn', false, 'gateway connection : request to authenticate acknowledged, no valid key received for basic password check.');
-        } else {
-          // Use it to build hashed password
-          logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : request to authenticate acknowledged, authenticating using basic password check...');
-          let hashedPwdCommand = '*#' + calcPass (gateway.pass, hashKey[1].toString()) + '##';
-          persistentObj.state = 'authenticating';
-          netSocket.write (hashedPwdCommand);
-        }
-      }
-      return false;
-    }
-
-    case 'authenticating_HMAC': {
-      // The gateway sent a random hashed key (Ra) needed to build a hash with password for connection request (Ra,Rb,A,B,Kab)
-      let Ra = packet.match (/^\*#(\d+)##/);
-      if (Ra === null) {
-        logNodeEvent (callingNode, 'warn', false, 'gateway connection : HMAC authentication step 1 : invalid random hash (Ra) received from server [' + packet + ']');
-      } else {
-        logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : HMAC authentication step 1 : random hash (Ra) received from server, sending response (Ra,Rb,A,B,Kab)...');
-        persistentObj.HMAC_Auth = calcHMAC (Ra[1], gateway.pass);
-        persistentObj.state = 'authenticating_HMAC_HashSent';
-        netSocket.write (persistentObj.HMAC_Auth[0]);
-      }
-      return false;
-    }
-
-    case 'authenticating_HMAC_HashSent': {
-      // The gateway accepted the hash we sent, which means password was OK, and it matches which what we expected (Ra,Rb,Kab)
-      if (packet === persistentObj.HMAC_Auth[1]) {
-        logNodeEvent (callingNode, 'debug', logEnabled, 'gateway connection : HMAC authentication step 2 : hashed response received from server (Ra,Rb,Kab) matched expectation, password was accepted...');
-        netSocket.write (ACK);
-        return completeConnection ();
-      }
-      logNodeEvent (callingNode, 'warn', false, 'gateway connection : HMAC authentication step 2 : hashed response received from server (Ra,Rb,Kab) but did not match expectation, aborting...');
-      netSocket.write (NACK);
-      error (startCommand, 'HMAC authentication step 2 : hashed response received from server (Ra,Rb,Kab) but did not match expectation.'); // error callback to stop function
-      return false;
-    }
-
-    case 'authenticating': {
-      return completeConnection ();
-    }
-  }
-}
-exports.processInitialConnection = processInitialConnection;
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// EXTERNAL Function : Gateway command execution function
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-function executeCommand (callingNode, commands, gateway, interCommandsDelay, processNextCmdOnFail, success, error) {
-  let net = require('net');
-
-  let client = new net.Socket();
-  let cmd_responses = [];
-  let cmd_sent = '';
-  let cmd_sent_count = 0;
-  let cmd_failed = [];
-  let cmd_failed_count = 0;
-  let cmd_success_count = 0;
-  let cmd_lastSent_count = 0;
-  let persistentObj = {};
-  persistentObj.logEnabled = gateway.log_out_cmd;
-  // Convert commands (which could be an array... or a string) to a single string and only take valid MyHome commands (back) to an array
-  commands = commands.toString().match(/\*.+?##/g);
-  if (commands === null) {
-    success ([], cmd_responses , cmd_failed);
-    return;
-  }
-
-  function internalError (cmd_failed, errorMsg) {
-    // Disconnect & reset state
-    persistentObj.state = 'disconnected';
-    client.destroy();
-    //  Build error message and return it
-    if (typeof(cmd_failed) === 'string') {
-      cmd_failed = [cmd_failed];
-    }
-    let nodeStatusErrorMsg;
-    if (cmd_failed.length > 1) {
-      nodeStatusErrorMsg = cmd_failed.length + ' commands failed.';
-    } else {
-      nodeStatusErrorMsg = 'command failed: ' + cmd_failed.toString();
-    }
-    callingNode.error ('commands [' + cmd_failed.toString() + '] failed : ' + errorMsg);
-    error (cmd_failed, nodeStatusErrorMsg);
-  }
-
-  function writeCommand (command , applyDelay)  {
-    let delay = (applyDelay) ? Math.max (interCommandsDelay , INTER_COMMANDS_DELAY) : 0;
-    setTimeout (function() {
-      client.write (command);
-    }, delay);
-  }
-
-  client.on ('error', function() {
-    internalError (commands, 'Command socket error');
-  });
-
-  client.on ('data', function (data) {
-    let allframes = data.toString();
-    let bufferedFrames = allframes;
-    while (bufferedFrames.length > 0) {
-      let packetMatch = bufferedFrames.match (/(\*.+?##)(.*)/) || [];
-      let packet = packetMatch[1] || '';
-      bufferedFrames = packetMatch[2] || '';
-      if (packet) {
-        logNodeEvent (callingNode, 'debug', false, "Parsing socket data (current: '" + packet + "' / buffered:'" + bufferedFrames + "' / full raw data : '" + allframes + "')");
-        // As long as initial connection is not OK, all packets are transmitted to a central function managing this
-        if (processInitialConnection (START_COMMAND, packet, client, callingNode, gateway, persistentObj, internalError)) {
-          // We are connected OK, pass the packet to the commands & responses management part
-          parsePacket (packet);
-        }
-      }
-    }
-  });
-  logNodeEvent (callingNode, 'debug', false, "mhutils.executeCommand('" + commands.join(',') + "'), opening connection to gateway...");
-  client.connect (gateway.port, gateway.host, function() {
-    // opening command session
-  });
-
-  function parsePacket (packet) {
-    if (cmd_sent !== '') {
-      // A command was sent, receiving gateway's response: process the response packet received
-      if (packet === NACK) {
-        // Error when processing a command...
-        cmd_failed_count++;
-        cmd_failed.push (cmd_sent);
-        logNodeEvent (callingNode, 'debug', false, "mhutils.executeCommand('" + cmd_sent + "'), command sent, but was not acknowledged (NACK). Command skipped.");
-        cmd_sent = '';
-      } else if (packet === ACK) {
-        // Command was sent, ACK received. Reset command sen to allow starting a new one
-        cmd_success_count++;
-        logNodeEvent (callingNode, 'debug', false, "mhutils.executeCommand('" + cmd_sent + "'), command sent, acknowledged (ACK), responses gathered : " + cmd_lastSent_count + ". This one is done.");
-        cmd_sent = '';
-      } else {
-        // Command was sent, but we still did not receive an acknowledged receipt, it means the socket is still emitting results of command sent
-        cmd_lastSent_count++;
-        cmd_responses.push (packet);
-        logNodeEvent (callingNode, 'debug', false, "mhutils.executeCommand('" + cmd_sent + "'), collecting response(s) [#" + cmd_lastSent_count + "] (current: '" + packet + "')");
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    function instanciateClient (delayBeforeRestart) {
+      // Try to connect (but do not allow 2 parallel calls)
+      if (isTryingToConnect) {
         return;
       }
+      // Keep track of attempted connections count and status (to avoid multiple attempts at the same time)
+      isTryingToConnect = true;
+      failedConnectionAttempts++;
+      node.log ('gateway connection : instantiating client... (attempt #' + failedConnectionAttempts + ')');
+      // if no more client available, re-init one
+      if (node.client === undefined) {
+        node.client = new net.Socket();
+      }
+      // Try to connect (if failed attempts occurred before, wait a bit more after each attempt to avoid overloading
+      // the socket, to a max time between tries being the time-out time defined)
+      let restartTimeout = (typeof(delayBeforeRestart) === 'undefined') ? RESTART_CONNECT_TIMEOUT : delayBeforeRestart;
+      restartTimeout = Math.min (restartTimeout * failedConnectionAttempts, RESTART_CONNECT_TIMEOUT_MAX);
+      if (restartTimeout > 0) {
+        node.log ('gateway connection : trying to reconnect to host in ' + restartTimeout/1000 + 's');
+      }
+      setTimeout (function() {
+        instanciateClient_Connect ();
+        isTryingToConnect = false;
+      }, restartTimeout);
+
+      function instanciateClient_Connect() {
+        node.log ('gateway connection : trying to connect to host...(' + node.host + ':' + node.port + ')');
+        node.client.connect (node.port, node.host, function() {
+          // request monitoring session (first connect returns a 'ACK' which is managed parsing frames)
+          node.log ('gateway connection : connected to host (' + node.host + ':' + node.port + '), initiating TCP monitoring...');
+
+          // Some gateways (e.g. MH201) never greet first with an unsolicited ACK: if nothing
+          // arrives within SPEAK_FIRST_TIMEOUT, request the session ourselves instead of waiting
+          // indefinitely for a greeting that will never come.
+          speakFirstTimer = setTimeout (function() {
+            speakFirstTimer = null;
+            node.debug ('gateway connection : gateway did not greet first within ' + SPEAK_FIRST_TIMEOUT + 'ms, requesting session proactively...');
+            persistentObj.state = 'sent_request';
+            node.client.write (START_MONITOR);
+          }, SPEAK_FIRST_TIMEOUT);
+        });
+      }
     }
-    if (cmd_sent === '') {
-      // If command send was reset, it means we can process next one (if any) or finalize
-      if (cmd_sent_count < commands.length && (cmd_failed_count === 0 || processNextCmdOnFail)) {
-        // We are connected, and still have command(s) to send
-        cmd_sent = commands[cmd_sent_count];
-        cmd_sent_count++;
-        cmd_lastSent_count = 0;
-        logNodeEvent (callingNode, 'debug', persistentObj.logEnabled, "Command '" + cmd_sent + "' sent using gateway...");
-        // Command is sent directly for first command, but delayed for next ones (if the gateway is not allowed to 'breathe' between commands, it tends to NACK commands)
-        writeCommand (cmd_sent , (cmd_sent_count >> 1));
+
+    function parseFrame (frame) {
+      if (frame === NACK) {
+        // When we have a non acknowledged return while connected, we ignore the error
+        // The MH201 returns a NACK on the keep alive process (which sends an ACK), and since MONITORING never sends commands, NACK can be ignored
+        // internalError (START_MONITOR, 'Command not acknowledged (NACK) when already connected');
         return;
       }
-      // All commands were sent, (N)ACK received, no more command to execute. Callback in success or error mode with all results
-      client.destroy();
-      if (cmd_success_count) {
-        // At least one command was OK, we consider this as a 'success'
-        if (cmd_failed_count) {
-          logNodeEvent (callingNode, 'debug', false, "mhutils.executeCommand('" + commands.join(', ') + "'), all commands sent, some failed (NACK) [" + cmd_failed_count + "], some acknowledged (ACK) [" + cmd_success_count + "], responses gathered : " + cmd_responses.length + ". All done now.");
-        } else {
-          logNodeEvent (callingNode, 'debug', false, "mhutils.executeCommand('" + commands.join(', ') + "'), all commands sent, all [" + cmd_success_count + "] acknowledged (ACK), responses gathered : " + cmd_responses.length + ". All done now.");
+
+      // Get the OpenWebNet WHO family linked to this command (structure is '*WHO*WHAT*WHERE##', and can be '*#WHO*WHAT*WHERE' for some kind of calls)
+      let ownFamily = frame.match (/^\*#{0,1}(\d+)\*.+?##/);
+      if (ownFamily !== null) {
+        let loggingEnabled = false;
+        let ownFamilyName = "";
+        if (ownFamily !== null) {
+          switch (ownFamily[1]) {
+            case '1': {
+              // WHO = 1 : Lighting
+              loggingEnabled = node.log_config.log_in_lights;
+              ownFamilyName = 'OWN_LIGHTS';
+              // Passively note down which AP this frame came from (WHERE), whatever its state (WHAT) is
+              let whereMatch = frame.match (/^\*1\*\d+\*(#?\d{1,4})(#4#(\d\d))?##/);
+              if (whereMatch) {
+                let buslevel = whereMatch[3] || '';
+                let pointid = whereMatch[1].replace ('#', '');
+                let isgroup = whereMatch[1].charAt(0) === '#';
+                let pointbusid = whereMatch[1] + (whereMatch[2] || '');
+                node.discoveredPoints.light[pointbusid] = {buslevel: buslevel, pointid: pointid, isgroup: isgroup};
+              }
+              break;
+            }
+            case '2': {
+              // WHO = 2 : Automation (Shutters management)
+              loggingEnabled = node.log_config.log_in_shutters;
+              ownFamilyName = 'OWN_SHUTTERS';
+              // Passively note down which AP this frame came from (WHERE), whatever its state (WHAT) is
+              let whereMatch = frame.match (/^\*2\*\d+\*(#?\d{1,4})(#4#(\d\d))?##/);
+              if (whereMatch) {
+                let buslevel = whereMatch[3] || '';
+                let pointid = whereMatch[1].replace ('#', '');
+                let isgroup = whereMatch[1].charAt(0) === '#';
+                let pointbusid = whereMatch[1] + (whereMatch[2] || '');
+                node.discoveredPoints.shutter[pointbusid] = {buslevel: buslevel, pointid: pointid, isgroup: isgroup};
+              }
+              break;
+            }
+            case '4': {
+              // WHO = 4 : Temperature Control/Heating
+              loggingEnabled = node.log_config.log_in_temperature;
+              ownFamilyName = 'OWN_TEMPERATURE';
+              // Passively note down which zone this frame came from (WHERE) - see ZONE_DISCOVERY_REGEXES above.
+              for (let re of ZONE_DISCOVERY_REGEXES) {
+                let whereMatch = frame.match (re);
+                if (whereMatch) {
+                  node.discoveredPoints.thermozone[whereMatch[1]] = {buslevel: 'private_riser', pointid: whereMatch[1], isgroup: false};
+                  break;
+                }
+              }
+              break;
+            }
+            case '15' : case '25' : {
+              // WHO = 15 (CEN) / 25 (CEN+) : Scenario Management
+              loggingEnabled = node.log_config.log_in_scenario;
+              ownFamilyName = 'OWN_SCENARIO';
+              break;
+            }
+            case '18': {
+              // WHO = 18 : Energy Management
+              loggingEnabled = node.log_config.log_in_energy;
+              ownFamilyName = 'OWN_ENERGY';
+              // Passively note down which meter/actuator this frame came from (WHERE), only forsponse, not a bare request
+              let whereMatch = frame.match (/^\*#18\*(5\d{1,3}|7\d{1,3}#0)\*[\d#]+\*(\d+\*)?\d+##/);
+              if (whereMatch) {
+                let isActuator = whereMatch[1].indexOf ('#0') >= 0;
+                let pointid = whereMatch[1].replace (/^[57]/, '').replace ('#0', '');
+                node.discoveredPoints.energy[whereMatch[1]] = {buslevel: (isActuator ? 'actuator' : 'meter'), pointid: pointid, isgroup: false};
+              }
+              break;
+            }
+            default: {
+              loggingEnabled = node.log_config.log_in_others;
+              ownFamilyName = 'OWN_OTHERS';
+            }
+          }
         }
-        success (commands, cmd_responses , cmd_failed);
-      } else {
-        // No command was acknowledged, return in error mode
-        internalError (cmd_failed, 'All commands (' + cmd_failed_count + ') were not acknowledged (NACK) when already connected.');
+        if (loggingEnabled) {
+          node.log ("Received OpenWebNet command (" + ownFamilyName + ") : '" + frame + "'");
+        }
+        if (ownFamilyName !== '') {
+          node.emit (ownFamilyName, ownFamilyName , frame);
+        }
       }
     }
-  }
 
-  client.on ('close', function() {
-    // to verify that no connections are left open
-    if (client !== undefined) {
-      client.destroy ();
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    this.disconnect = function (restartTimeout) {
+      // Only warn / update status when status is not already 'disconnected'
+      if (persistentObj.state !== 'disconnected') {
+        node.warn ("gateway connection : disconnected from host, last known state was '" + persistentObj.state + "'." + ((restartTimeout) ? ' Auto retry activated.' : ''));
+        persistentObj.state = 'disconnected';
+      }
+      if (speakFirstTimer) { clearTimeout (speakFirstTimer); speakFirstTimer = null; }
+      // if client is still running, stop it
+      if (node.client !== undefined) {
+        node.client.removeAllListeners ('connect'); // Ensure no more 'connect' listeners are left (which would be called back multiple times on re-connect)
+        node.client.destroy();
+      }
+      // Restart the client if asked (but only after the specified number of ms)
+      if (restartTimeout > 0) {
+        instanciateClient (restartTimeout);
+      }
+    };
+
+    instanciateClient (0);
+    // Once client is started, init a repeater which will keep connection alive (only if configured so in gateway)
+    // TechNote :
+    //  - sending a START_MONITOR command here causes some gateways (myHOMEServer1) to close connection, forcing a re-instantiation, ACK is enough...
+    //  - but when sending a simple ACK, some (MH201) returned a NACK, which is now no longer forcing a disconnection in the gateway.
+    function checkConnection() {
+      if (failedConnectionAttempts === 0) {
+        node.debug ('gateway connection : keeping connection alive every ' + node.timeout/1000 + 's ...');
+        node.client.write (ACK);
+      }
     }
-    return;
+    let autoCheckConnection;
+    if (node.timeout) {
+      autoCheckConnection = setInterval (checkConnection, node.timeout);
+    }
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    node.on ('close', function (done)	{
+      // Disable auto-refresh of connection & close connection properly
+      if (autoCheckConnection !== undefined) {
+        clearInterval(autoCheckConnection);
+      }
+      node.disconnect (0);
+      node.client.removeAllListeners ('connect');
+      node.client.removeAllListeners ('close');
+      node.client.removeAllListeners ('error');
+      node.client.removeAllListeners ('data');
+      node.client.close();
+      done();
+    });
+  }
+  RED.nodes.registerType ('myhome-gateway', MyHomeGatewayNode);
+
+  //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Admin endpoint used by the gateway config editor's points-registry sections to read AP passively
+  // observed so far on the bus (see node.discoveredPoints above) - a plain read of already-known state,
+  // triggers nothing on the bus itself, so it is safe to call every time the editor dialog opens.
+  // A category not (yet) tracked in node.discoveredPoints simply returns no points, not an error.
+  RED.httpAdmin.get ('/myhome-bticino/gateway/:id/discovered-points/:category', RED.auth.needsPermission ('myhome-gateway.read'), function (req, res) {
+    let gatewayNode = RED.nodes.getNode (req.params.id);
+    let categoryPoints = gatewayNode ? gatewayNode.discoveredPoints[req.params.category] : undefined;
+    res.json ({points: categoryPoints ? Object.values (categoryPoints) : []});
   });
-}
-exports.executeCommand = executeCommand;
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// EXTERNAL Class : Listeners management
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-class eventsMonitor {
-  // This class is intended to manage listeners linked to a specific object in a centralized object
-  // to be able to easily clear them off when entity unloads
-  constructor (monitoredEntity) {
-    this.monitoredEntity = monitoredEntity;
-    this.runningListeners = [];
-  }
-
-  addMonitoredEvent (eventName, eventFunction) {
-    // Store the registered event to be able to de-activate it when necessary
-    let newListener = {};
-    newListener.eventName = eventName;
-    newListener.listenerFunction = eventFunction;
-    this.runningListeners.push (newListener);
-    // Register the listener
-    this.monitoredEntity.addListener (newListener.eventName, newListener.listenerFunction);
-  }
-
-  clearAllMonitoredEvents () {
-    // Disable all listeners which were activated
-    for (let listenerCount = this.runningListeners.length-1 ; listenerCount >= 0  ; listenerCount--) {
-      let runningListener = this.runningListeners[listenerCount];
-      // Disable listener on monitored entity
-      this.monitoredEntity.removeListener (runningListener.eventName, runningListener.listenerFunction);
-      // Remove the listener from stored ones since no further call possible on it
-      this.runningListeners.splice (listenerCount, 1);
-    }
-  }
-}
-exports.eventsMonitor = eventsMonitor;
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// EXTERNAL Function : Node Secondary output generator (based on load ON/OFF state)
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-function buildSecondaryOutput (primaryClonedMsg, payloadInfo , config, outputDefaultName, trueTextValue, falseTextValue) {
-  // Build state content based on configured type (text or boolean)
-  let msg2_value;
-  let msg2_type = (config.output2_type === undefined) ? 'boolean' : config.output2_type;
-  if (msg2_type === 'text_state') {
-    // Using default property (state), the output is the state itself
-    msg2_value = payloadInfo.state;
-  } else if (msg2_type === 'boolean') {
-    // Using default property (state) to define whether is true/false
-    if (payloadInfo.state === trueTextValue) {
-      msg2_value = true;
-    } else if (payloadInfo.state === falseTextValue) {
-      msg2_value = false;
-    } else {
-      msg2_value = -1;
-    }
-  } else {
-    // Any other value set as 'output2_type' means we have to find this property in current payloadInfo to return its content
-    // Samples : 'brightness' to get 'payloadInfo.brightness', or also 'actuatorStates.actuator_1.state' to get 'payloadInfo.actuatorStates.actuator_1.state'
-    msg2_value = payloadInfo;
-    for (let propertyName of msg2_type.split('.')) {
-      msg2_value = msg2_value[propertyName];
-    }
-  }
-  // Build & return a new msg object
-  let msg2 = primaryClonedMsg;
-  let msg2_name = (config.output2_name === undefined) ? outputDefaultName : config.output2_name;
-  if (msg2_name === '') {
-    // Output property is empty, which means we have to return a non-object payload
-    msg2.payload = msg2_value;
-  } else {
-    // Build a payload object using the defined property name
-    msg2.payload = {};
-    msg2.payload[msg2_name] = msg2_value;
-  }
-  return msg2;
-}
-exports.buildSecondaryOutput = buildSecondaryOutput;
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// EXTERNAL Function : Merge provided text with a date using specified formats (MM, DD, YYYY,...)
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-function dateTxtMerge (dateToFormat , textFormat) {
-  // Function to convert a provided date to a fixed 'readable' date+time format
-  //  - dateToFormat : any content which can be converted to a valid date-time
-  //  - textFormat : the output 'template' as text were replacement by date-time parts
-  //      (only YY, YYYY, MM, M, DD, D, hh, nn, ss are supported for now)
-  let dateInit = new Date(dateToFormat);
-  let formattedDate = textFormat
-    .replace('YYYY' , dateInit.getFullYear())
-    .replace('YY' , dateInit.getFullYear().toString().slice(-2))
-    .replace('MM' , ('0' + (dateInit.getMonth()+1)).slice(-2))
-    .replace('M' , (dateInit.getMonth()+1))
-    .replace('DD' , ('0' + dateInit.getDate()).slice(-2))
-    .replace('D' , dateInit.getDate())
-    .replace('hh' , ('0' + dateInit.getHours()).slice(-2))
-    .replace('nn' , ('0' + dateInit.getMinutes()).slice(-2))
-    .replace('ss' , ('0' + dateInit.getSeconds()).slice(-2));
-
-  return formattedDate;
-}
-exports.dateTxtMerge = dateTxtMerge;
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// EXTERNAL Function : Convert a number to a human readable / summarized form (1.000 -> k or 1.000.000 -> M)
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-function numberToAbbr (numberToFormat , suffix) {
-  // Function to convert a provided date number to a 'human readable' (980 remains 980, 1980 becomes 1,98k, 1980654 becomes 1,98M)
-  //  - numberToFormat : the number to process
-  //  - suffix : optional suffix to append at the end of string returned
-
-  // When provided number is very large, first bring it back to 'Mega' or 'kilo' corresponding value
-  if (numberToFormat > 10**6) {
-    numberToFormat = numberToFormat / 10**6;
-    suffix = 'M' + suffix;
-  } else if (numberToFormat > 10**3) {
-    numberToFormat = numberToFormat / 10**3;
-    suffix = 'k' + suffix;
-  }
-  // Return string values only keeping 2 decimals + built (and provided) suffix(es)
-  return (Math.round(numberToFormat*100)/100).toLocaleString() + suffix;
-}
-exports.numberToAbbr = numberToAbbr;
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// MHUtils INTERNAL function : used to build HAC hashed value to connect to gateway secured in SHA1 or SHA256 mode
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-function calcHMAC (Ra, password) {
-  const HMAC_COPEN = '736F70653E';
-  const HMAC_SOPEN = '636F70653E';
-
-  let crypto = require ('crypto');
-
-  // Define which algorithm is being used based on received Ra length
-  let shaAlgo;
-  if (Ra.length === 80) {
-    shaAlgo = 'sha1';
-  } else if (Ra.length === 128) {
-    shaAlgo = 'sha256';
-  } else {
-    return;
-  }
-
-  // Use a SHA encryptor to build hashed contents
-  let Rb = crypto.createHmac(shaAlgo, Math.random().toString(36)).digest('hex');
-  let pwd = crypto.createHash(shaAlgo).update(password).digest('hex');
-  // Build the connection request to be sent (which is *#Rb*HMAC(Ra+Rb+A+B+Kab)##)
-  let contentToHash = digitToHex(Ra) + Rb + HMAC_COPEN + HMAC_SOPEN + pwd;
-  let connectionRequest = '*#' + hexToDigit(Rb) + '*' + hexToDigit(crypto.createHash(shaAlgo).update(contentToHash).digest('hex')) + '##'; // *Rb#HMAC(Ra+Rb+A+B+Kab)##
-  // Build the expected response if connection is OK (which is *#HMAC(Ra+Rb+Kab)##)
-  contentToHash = digitToHex(Ra) + Rb + pwd;
-  let expectedResponse = '*#' + hexToDigit(crypto.createHash(shaAlgo).update(contentToHash).digest('hex')) + '##' ;
-  // Return connection request & expected response
-  return [connectionRequest, expectedResponse];
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// MHUtils INTERNAL function : required for HMAC connection to convert BUS received values (numbers) to Hexa values
-function digitToHex (toConvertVal){
-    let convertedVal = "";
-    for (let i = 0; i < toConvertVal.length; i=i+2) {
-        let hexVal = parseInt(toConvertVal.slice(i, i+2)).toString(16);
-        convertedVal = convertedVal + hexVal;
-    }
-    return convertedVal;
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// MHUtils INTERNAL function : required for HMAC connection to convert Hexa values to BUS acceptable values (numbers)
-function hexToDigit (toConvertVal){
-    let convertedVal = "";
-    for (let i = 0; i < toConvertVal.length; i++) {
-        let hexVal = parseInt(toConvertVal[i], 16);
-        convertedVal = convertedVal + ('0' + hexVal).slice(-2);
-    }
-    return convertedVal;
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// MHUtils INTERNAL function : used in basic authentication mode to 'hash' the Open password
-function calcPass (pass, nonce) {
-  let flag = true;
-  let num1 = 0x0;
-  let num2 = 0x0;
-  let password = parseInt(pass, 10);
-
-  for (var c in nonce) {
-    c = nonce[c];
-    if (c!='0') {
-      if (flag) num2 = password;
-      flag = false;
-    }
-    switch (c) {
-      case '1':
-        num1 = num2 & 0xFFFFFF80;
-        num1 = num1 >>> 7;
-        num2 = num2 << 25;
-        num1 = num1 + num2;
-        break;
-      case '2':
-        num1 = num2 & 0xFFFFFFF0;
-        num1 = num1 >>> 4;
-        num2 = num2 << 28;
-        num1 = num1 + num2;
-        break;
-      case '3':
-        num1 = num2 & 0xFFFFFFF8;
-        num1 = num1 >>> 3;
-        num2 = num2 << 29;
-        num1 = num1 + num2;
-        break;
-      case '4':
-        num1 = num2 << 1;
-        num2 = num2 >>> 31;
-        num1 = num1 + num2;
-        break;
-      case '5':
-        num1 = num2 << 5;
-        num2 = num2 >>> 27;
-        num1 = num1 + num2;
-        break;
-      case '6':
-        num1 = num2 << 12;
-        num2 = num2 >>> 20;
-        num1 = num1 + num2;
-        break;
-      case '7':
-        num1 = num2 & 0x0000FF00;
-        num1 = num1 + (( num2 & 0x000000FF ) << 24 );
-        num1 = num1 + (( num2 & 0x00FF0000 ) >>> 16 );
-        num2 = ( num2 & 0xFF000000 ) >>> 8;
-        num1 = num1 + num2;
-        break;
-      case '8':
-        num1 = num2 & 0x0000FFFF;
-        num1 = num1 << 16;
-        num1 = num1 + ( num2 >>> 24 );
-        num2 = num2 & 0x00FF0000;
-        num2 = num2 >>> 8;
-        num1 = num1 + num2;
-        break;
-      case '9':
-        num1 = ~num2;
-        break;
-      case '0':
-        num1 = num2;
-        break;
-    }
-    num2 = num1;
-  }
-  return (num1 >>> 0).toString();
-}
+};
