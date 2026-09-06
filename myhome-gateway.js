@@ -7,6 +7,7 @@ module.exports = function (RED) {
   const START_MONITOR = '*99*1##';
   const RESTART_CONNECT_TIMEOUT = 500; // ms
   const RESTART_CONNECT_TIMEOUT_MAX = 30000; // ms
+  const SPEAK_FIRST_TIMEOUT = 800; // ms - some gateways (e.g. MH201) never send an unsolicited greeting ACK
 
   // WHO=4 passive discovery, one regex per frame shape myhome-thermo-zone.js itself reads
   const ZONE_DISCOVERY_REGEXES = [
@@ -24,6 +25,7 @@ module.exports = function (RED) {
     let persistentObj = {logEnabled:true}; // Log is always enabled when gateway connects
     let failedConnectionAttempts = 0;
     let isTryingToConnect = false;
+    let speakFirstTimer;
 
     node.client = undefined;
     node.host = config.host;
@@ -50,6 +52,7 @@ module.exports = function (RED) {
     node.client = new net.Socket();
 
       node.client.on ('data', function (data) {
+        if (speakFirstTimer) { clearTimeout (speakFirstTimer); speakFirstTimer = null; }
         let allframes = data.toString();
         let bufferedFrames = allframes;
         while (bufferedFrames.length > 0) {
@@ -79,6 +82,7 @@ module.exports = function (RED) {
     function internalError (cmd_failed, errorMsg) {
       // In case of error / disconnection / close, try automated restart
       node.warn ("gateway connection issue (" + errorMsg + "): last known state was '" + persistentObj.state + "', trying to re-connect...");
+      if (speakFirstTimer) { clearTimeout (speakFirstTimer); speakFirstTimer = null; }
       node.disconnect (RESTART_CONNECT_TIMEOUT);
     }
 
@@ -113,6 +117,16 @@ module.exports = function (RED) {
         node.client.connect (node.port, node.host, function() {
           // request monitoring session (first connect returns a 'ACK' which is managed parsing frames)
           node.log ('gateway connection : connected to host (' + node.host + ':' + node.port + '), initiating TCP monitoring...');
+
+          // Some gateways (e.g. MH201) never greet first with an unsolicited ACK: if nothing
+          // arrives within SPEAK_FIRST_TIMEOUT, request the session ourselves instead of waiting
+          // indefinitely for a greeting that will never come.
+          speakFirstTimer = setTimeout (function() {
+            speakFirstTimer = null;
+            node.debug ('gateway connection : gateway did not greet first within ' + SPEAK_FIRST_TIMEOUT + 'ms, requesting session proactively...');
+            persistentObj.state = 'sent_request';
+            node.client.write (START_MONITOR);
+          }, SPEAK_FIRST_TIMEOUT);
         });
       }
     }
@@ -217,6 +231,7 @@ module.exports = function (RED) {
         node.warn ("gateway connection : disconnected from host, last known state was '" + persistentObj.state + "'." + ((restartTimeout) ? ' Auto retry activated.' : ''));
         persistentObj.state = 'disconnected';
       }
+      if (speakFirstTimer) { clearTimeout (speakFirstTimer); speakFirstTimer = null; }
       // if client is still running, stop it
       if (node.client !== undefined) {
         node.client.removeAllListeners ('connect'); // Ensure no more 'connect' listeners are left (which would be called back multiple times on re-connect)
